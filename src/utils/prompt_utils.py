@@ -213,9 +213,9 @@ def get_token_meta_labels(prompt_data, tokenizer, query=None, prepend_bos=False)
     if isinstance(query, list):
         query = query[0]
         
-    prompt_parts, prompt_part_labels = get_prompt_parts_and_labels(prompt_data, query_sentence=query)
+    prompt_parts, prompt_part_labels = get_prompt_parts_and_labels(prompt_data, query_sentence=query) # ['<|endoftext|>', '', '', ['Q:', ' valley', '\n', 'A:', ' mountain', '\n\n'],...],  labels:['bos_token', 'instructions_token', 'separator_token', ['structural_token', 'demonstration_1_token', 'separator_token', 'structural_token', 'demonstration_1_label_token', 'separator_token'],...]
     token_meta_labels = tokenize_labels(prompt_parts, prompt_part_labels, tokenizer, prepend_bos)
-    prompt_string = create_prompt(prompt_data=prompt_data, sentence=query)
+    prompt_string = create_prompt(prompt_data=prompt_data, sentence=query) # '<|endoftext|>Q: valley\nA: mountain\n\nQ: economic\nA: uneconomic...
     tokens = [tokenizer.decode(x) for x in tokenizer(prompt_string).input_ids]
     token_labels = list(zip(np.arange(len(tokens)), tokens, token_meta_labels))
 
@@ -421,7 +421,7 @@ def load_dataset(task_name: str,
     dataset: the dict contain the train/valid/test dataset splits
     """
 
-    data_folders = ['abstractive', 'extractive']
+    data_folders = ['abstractive', 'extractive',]
     assert test_size <= 1.0
 
     path = Path(root_data_dir)
@@ -431,6 +431,42 @@ def load_dataset(task_name: str,
 
     assert len(d_group) !=0 and len(d_group) == 1, f"Error! 'task_name'={task_name}.json must be uniquely contained in one of these directories:{data_folders}. Please check the root_data_dir"
     dataset_folder = d_group[0][0]
+    
+    d_path = os.path.join(path, dataset_folder, f'{task_name}.json')
+    
+    dataset = ICLDataset(d_path)
+    dataset = split_icl_dataset(dataset, test_size=test_size, seed=seed)
+
+    return dataset
+
+def load_dataset2(task_name: str,
+                 dataset_folder: str,
+                 root_data_dir: str = '../dataset_files',
+                 test_size = 0.3, 
+                 seed=32
+                ) -> Dict[str,ICLDataset]:
+    """
+    Loads a dataset with input/output pairs
+
+    Parameters:
+    task_name: the name of the task dataset
+    root_data_dir: the root directory where the data comes from
+    test_size: fraction used in train/test split
+    
+    Return:
+    dataset: the dict contain the train/valid/test dataset splits
+    """
+
+    # data_folders = ['antonym', 'capitalize', 'capitalize_first_letter']
+    # assert test_size <= 1.0
+
+    path = Path(root_data_dir)
+    # d_group_map = [(dataset_type, os.path.exists(os.path.join(root_data_dir, dataset_type, task_name+'.json'))) for dataset_type in data_folders]
+
+    # d_group = list(filter(lambda x: x[1], d_group_map))
+
+    # assert len(d_group) !=0 and len(d_group) == 1, f"Error! 'task_name'={task_name}.json must be uniquely contained in one of these directories:{data_folders}. Please check the root_data_dir"
+    # dataset_folder = d_group[0][0]
     
     d_path = os.path.join(path, dataset_folder, f'{task_name}.json')
     

@@ -9,6 +9,8 @@ from utils.extract_utils import get_mean_head_activations, compute_universal_fun
 from utils.intervention_utils import fv_intervention_natural_text
 from utils.model_utils import load_gpt_model_and_tokenizer
 from utils.prompt_utils import load_dataset
+from run_reinforce import *
+from utils.extract_utils import *
 
 
 def natural_text_eval(dataset, fv_vector, model, model_config, tokenizer, filter_set, edit_layer=9, MNT=5, verbose=False, loc_data=False):
@@ -78,7 +80,7 @@ def natural_text_eval(dataset, fv_vector, model, model_config, tokenizer, filter
 
     return all_scores, all_clean_scores, sentences
 
-def nattext_main(datasets, model, model_config, tokenizer, root_data_dir='../dataset_files', edit_layer=9, n_shots=10, n_trials=100, n_seeds=5):
+def nattext_main(datasets, model, model_config, tokenizer, root_data_dir='../dataset_files', edit_layer=9, n_shots=10, n_trials=100, n_seeds=5,save_path_root=None):
     """
     Main function that evaluates causal effects of function vectors on natural text templates.
 
@@ -110,7 +112,7 @@ def nattext_main(datasets, model, model_config, tokenizer, root_data_dir='../dat
         else:
             loc_data = False
             max_new_tokens = 5
-
+        ie_path_root = f"{save_path_root}/{dataset_name}"
         for _ in range(n_seeds):
             seed = np.random.randint(100000)
             seeds_dict[dataset_name].append(seed)
@@ -118,11 +120,25 @@ def nattext_main(datasets, model, model_config, tokenizer, root_data_dir='../dat
 
             fs_results_validation = n_shot_eval_no_intervention(dataset=dataset, n_shots=n_shots, model=model, model_config=model_config, tokenizer=tokenizer, compute_ppl=False, test_split='valid')
             filter_set_validation = np.where(np.array(fs_results_validation['clean_rank_list']) == 0)[0]
+            #————————————————————————⬇————————————————————————#
+            mean_activations_path = None
+            if mean_activations_path is not None and os.path.exists(mean_activations_path):
+                mean_activations = torch.load(mean_activations_path)
+            elif mean_activations_path is None and os.path.exists(f'{ie_path_root}/{dataset_name}_mean_head_activations.pt'):
+                mean_activations_path = f'{ie_path_root}/{dataset_name}_mean_head_activations.pt'
+                mean_activations = torch.load(mean_activations_path) 
+
+            bernoullis_path = f"{ie_path_root}/{dataset_name}_bernoullis.pt"
+            bernoullis_save_path = f"{ie_path_root}/bernoullis.pt"
+            if os.path.exists(bernoullis_save_path):
+                bernoullis = torch.load(bernoullis_save_path)
+
+            fv = compute_reinforce_function_vector(args, bernoullis_path, bernoullis, mean_activations, model, model_config, tokenizer, dataset)
             
-            mean_activations = get_mean_head_activations(dataset, model=model, model_config=model_config, tokenizer=tokenizer, n_icl_examples=n_shots,
-                                                        N_TRIALS=n_trials, filter_set=filter_set_validation)
-            fv, _ = compute_universal_function_vector(mean_activations, model, model_config)
-            
+            # mean_activations = get_mean_head_activations(dataset, model=model, model_config=model_config, tokenizer=tokenizer, n_icl_examples=n_shots,
+            #                                             N_TRIALS=n_trials, filter_set=filter_set_validation)
+            # fv, _ = compute_universal_function_vector(mean_activations, model, model_config)
+            #————————————————————————⬆————————————————————————#
             fs_results = n_shot_eval_no_intervention(dataset=dataset, n_shots=n_shots, model=model, model_config=model_config, tokenizer=tokenizer, compute_ppl=False, test_split='test')
             filter_set = np.where(np.array(fs_results['clean_rank_list']) == 0)[0]
             
@@ -138,12 +154,13 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_name', help='Name of model to be loaded', type=str, required=False, default='EleutherAI/gpt-j-6b')
-    parser.add_argument('--root_data_dir', help='Root directory of data files', type=str, required=False, default='../dataset_files')
+    parser.add_argument('--root_data_dir', help='Root directory of data files', type=str, required=False, default='/storage/3090group2/hyl/function_vectors/dataset_files')
     parser.add_argument('--save_path_root', help='File path to save mean activations to', type=str, required=False, default='../results')
     parser.add_argument('--n_seeds', help='Number of seeds', type=int, required=False, default=5)
     parser.add_argument('--n_trials', help='Number of trials to use for computing task-conditioned mean head activations', type=int, required=False, default=100)
     parser.add_argument('--n_shots', help='Number of shots to use for prompts when computing task-conditioned mean head activations', type=int, required=False, default=10)
     parser.add_argument('--edit_layer', help='Layer to add function vector to', type=int, required=False, default=9)
+    parser.add_argument('--datasets', nargs='+', default=['antonym', 'capitalize', 'country-capital', 'english-french', 'present-past', 'singular-plural'], help='List of datasets to evaluate on')
 
     args = parser.parse_args()
     
@@ -151,6 +168,7 @@ if __name__ == "__main__":
     model_name = args.model_name
     root_data_dir = args.root_data_dir
     save_path_root = args.save_path_root
+    
     n_seeds = args.n_seeds
     n_trials = args.n_trials
     n_shots = args.n_shots
@@ -162,15 +180,19 @@ if __name__ == "__main__":
     model, tokenizer, model_config = load_gpt_model_and_tokenizer(model_name)
 
     datasets = ['antonym', 'capitalize', 'country-capital', 'english-french', 'present-past', 'singular-plural']
+    # datasets = args.datasets
     args.datasets = datasets
 
     # Run Natural Text Eval
     clean_results_dict, interv_results_dict, seeds_dict = nattext_main(datasets, model, model_config, tokenizer, 
                                                                        root_data_dir=root_data_dir, edit_layer=edit_layer, 
-                                                                       n_shots=n_shots, n_trials=n_trials, n_seeds=n_seeds)
+                                                                       n_shots=n_shots, n_trials=n_trials, n_seeds=n_seeds,save_path_root=save_path_root)
 
     # Extract Summary Results:
     os.makedirs(os.path.join(save_path_root), exist_ok=True)
+    # for d in datasets:
+    #     with open(os.path.join(save_path_root, f'{d}_nattext_eval_results.txt'), 'w') as out_file:
+
     with open(os.path.join(save_path_root, 'nattext_eval_results.txt'), 'w') as out_file:
         for d in datasets:
             print(f"{d.title()}:", file=out_file)

@@ -1,5 +1,6 @@
 import os, re, json
-
+import sys
+print(sys.path)
 import torch, numpy as np
 import pandas as pd
 from baukit import TraceDict
@@ -9,6 +10,7 @@ from .prompt_utils import *
 from .intervention_utils import *
 from .model_utils import *
 from .eval_utils import *
+from run_reinforce import *
 
 
 # Attention Activations
@@ -95,7 +97,7 @@ def get_mean_head_activations(dataset, model, model_config, tokenizer, n_icl_exa
                                                             tokenizer=tokenizer, 
                                                             model_config=model_config)
         
-        stack_initial = torch.vstack([split_activations_by_head(activations_td[layer].input, model_config) for layer in model_config['attn_hook_names']]).permute(0,2,1,3)
+        stack_initial = torch.vstack([split_activations_by_head(activations_td[layer].input, model_config).to('cuda:0') for layer in model_config['attn_hook_names']]).permute(0,2,1,3)
         stack_filtered = stack_initial[:,:,list(idx_map.keys())]
         for (i,j) in idx_avg.values():
             stack_filtered[:,:,idx_map[i]] = stack_initial[:,:,i:j+1].mean(axis=2) # Average activations of multi-token words across all its tokens
@@ -338,7 +340,7 @@ def compute_function_vector(mean_activations, indirect_effect, model, model_conf
     top_heads = top_lh[:n_top_heads]
 
     # Compute Function Vector as sum of influential heads
-    function_vector = torch.zeros((1,1,model_resid_dim)).to(device)
+    function_vector = torch.zeros((1,1,model_resid_dim))
     T = -1 # Intervention & values taken from last token
 
     for L,H,_ in top_heads:
@@ -350,7 +352,13 @@ def compute_function_vector(mean_activations, indirect_effect, model, model_conf
             out_proj = model.model.layers[L].self_attn.o_proj
         elif 'gpt-neox' in model_config['name_or_path'] or 'pythia' in model_config['name_or_path']:
             out_proj = model.gpt_neox.layers[L].attention.dense
+        elif 'qwen' in model_config['name_or_path'].lower():
+            out_proj = model.model.layers[L].self_attn.o_proj
+        elif 'deepseek' in model_config['name_or_path'].lower():
+            out_proj = model.model.layers[L].self_attn.o_proj
 
+        device = next(out_proj.parameters()).device
+        function_vector = function_vector.to(device)
         x = torch.zeros(model_resid_dim)
         x[H*model_head_dim:(H+1)*model_head_dim] = mean_activations[L,H,T]
         d_out = out_proj(x.reshape(1,1,model_resid_dim).to(device).to(model.dtype))
@@ -466,6 +474,10 @@ def compute_universal_function_vector(mean_activations, model, model_config, n_t
             out_proj = model.model.layers[L].self_attn.o_proj
         elif 'gpt-neox' in model_config['name_or_path']:
             out_proj = model.gpt_neox.layers[L].attention.dense
+        elif 'qwen' in model_config['name_or_path'].lower():
+            out_proj = model.model.layers[L].self_attn.o_proj
+        elif 'deepseek' in model_config['name_or_path'].lower():
+            out_proj = model.model.layers[L].self_attn.o_proj
 
         x = torch.zeros(model_resid_dim)
         x[H*model_head_dim:(H+1)*model_head_dim] = mean_activations[L,H,T]
@@ -476,3 +488,218 @@ def compute_universal_function_vector(mean_activations, model, model_config, n_t
     function_vector = function_vector.reshape(1, model_resid_dim)
 
     return function_vector, top_heads
+#————————————————————————⬇————————————————————————#
+def compute_reinforce_function_vector(args, bernoullis_path, bernoullis, mean_activations, model, model_config, tokenizer, dataset):
+    # top_heads = (999, None)
+    if not os.path.exists(bernoullis_path):
+        if isinstance(bernoullis[0], tuple):
+            bernoullis = torch.stack([torch.tensor([x[0].item(), x[1].item(), x[2]]) for x in bernoullis])
+        if args.head_selection_threshold == "above_mean_once":
+            # 一次平均
+            bernoullis_flat = bernoullis.flatten()
+            bernoullis_mean = bernoullis_flat.mean()
+            bernoullis_mask = bernoullis_flat > bernoullis_mean
+
+            indices = torch.nonzero(bernoullis_mask, as_tuple=False).squeeze() # 402个
+
+            rows = indices // bernoullis.size(1)
+            cols = indices % bernoullis.size(1)
+            top_heads = [(rows[i], cols[i], -1) for i in range(len(rows))]
+        elif args.head_selection_threshold == "above_mean_twice":
+            # 两次平均
+            bernoullis_flat = bernoullis.flatten()
+            bernoullis_mean1 = bernoullis_flat.mean()
+            bernoullis_mask1 = bernoullis_flat > bernoullis_mean1
+            bernoullis_filtered1 = bernoullis_flat[bernoullis_mask1]
+
+            bernoullis_mean2 = bernoullis_filtered1.mean()
+            bernoullis_mask2 = bernoullis_filtered1 > bernoullis_mean2
+            bernoullis_filtered2 = bernoullis_filtered1[bernoullis_mask2]
+            indices_lvl1 = torch.nonzero(bernoullis_mask1, as_tuple=False).squeeze()
+            final_indices = indices_lvl1[bernoullis_mask2]
+
+            # values_flat = bernoullis.flatten()
+            # topk_values, final_indices = torch.topk(values_flat, k=50, largest=True)
+
+            rows = final_indices // bernoullis.size(1)
+            cols = final_indices % bernoullis.size(1)
+
+            top_heads = [(rows[i], cols[i], -1) for i in range(len(rows))]
+        elif args.head_selection_threshold == "above_mean_thrice":
+            # 三次平均
+            bernoullis_flat = bernoullis.flatten()
+            bernoullis_mean1 = bernoullis_flat.mean()
+            bernoullis_mask1 = bernoullis_flat > bernoullis_mean1
+            bernoullis_filtered1 = bernoullis_flat[bernoullis_mask1]
+
+            bernoullis_mean2 = bernoullis_filtered1.mean()
+            bernoullis_mask2 = bernoullis_filtered1 > bernoullis_mean2
+            bernoullis_filtered2 = bernoullis_filtered1[bernoullis_mask2]
+
+            bernoullis_mean3 = bernoullis_filtered2.mean()
+            bernoullis_mask3 = bernoullis_filtered2 > bernoullis_mean3
+            bernoullis_filtered3 = bernoullis_filtered2[bernoullis_mask3]
+
+            indices_lvl1 = torch.nonzero(bernoullis_mask1, as_tuple=False).squeeze()
+            temp_idx = indices_lvl1[bernoullis_mask2]
+            final_indices = temp_idx[bernoullis_mask3]
+
+            rows = final_indices // bernoullis.size(1)
+            cols = final_indices % bernoullis.size(1)
+            top_heads = [(rows[i], cols[i], -1) for i in range(len(rows))]
+        elif args.head_selection_threshold == "above_mean_forth":
+            # 四次平均
+            bernoullis_flat = bernoullis.flatten()
+            bernoullis_mean1 = bernoullis_flat.mean()
+            bernoullis_mask1 = bernoullis_flat > bernoullis_mean1
+            bernoullis_filtered1 = bernoullis_flat[bernoullis_mask1]
+
+            bernoullis_mean2 = bernoullis_filtered1.mean()
+            bernoullis_mask2 = bernoullis_filtered1 > bernoullis_mean2
+            bernoullis_filtered2 = bernoullis_filtered1[bernoullis_mask2]
+
+            bernoullis_mean3 = bernoullis_filtered2.mean()
+            bernoullis_mask3 = bernoullis_filtered2 > bernoullis_mean3
+            bernoullis_filtered3 = bernoullis_filtered2[bernoullis_mask3]
+
+            bernoullis_mean4 = bernoullis_filtered3.mean()
+            bernoullis_mask4 = bernoullis_filtered3 > bernoullis_mean4
+            bernoullis_filtered4 = bernoullis_filtered3[bernoullis_mask4]
+
+            indices_lvl1 = torch.nonzero(bernoullis_mask1, as_tuple=False).squeeze()
+            temp_idx1 = indices_lvl1[bernoullis_mask2]
+            temp_idx2 = temp_idx1[bernoullis_mask3]
+            final_indices = temp_idx2[bernoullis_mask4]
+
+            rows = final_indices // bernoullis.size(1)
+            cols = final_indices % bernoullis.size(1)
+            top_heads = [(rows[i], cols[i], -1) for i in range(len(rows))]
+
+        elif args.head_selection_threshold == "above_0.5":
+            # 不平均
+            indices = torch.nonzero(bernoullis > 0.5, as_tuple=False)
+            top_heads = [(int(idx[0]), int(idx[1]), -1) for idx in indices]
+
+        elif args.head_selection_threshold == "above_0.6":
+            # 不平均
+            indices = torch.nonzero(bernoullis > 0.6, as_tuple=False)
+            top_heads = [(int(idx[0]), int(idx[1]), -1) for idx in indices]
+
+        elif args.head_selection_threshold == "above_0.7":
+            # 不平均
+            indices = torch.nonzero(bernoullis > 0.7, as_tuple=False)
+            top_heads = [(int(idx[0]), int(idx[1]), -1) for idx in indices]
+
+        elif args.head_selection_threshold == "above_0.8":
+            # 不平均
+            indices = torch.nonzero(bernoullis > 0.8, as_tuple=False)
+            top_heads = [(int(idx[0]), int(idx[1]), -1) for idx in indices]
+
+        elif args.head_selection_threshold == "above_0.9":
+            # 不平均
+            indices = torch.nonzero(bernoullis > 0.9, as_tuple=False)
+            top_heads = [(int(idx[0]), int(idx[1]), -1) for idx in indices]
+
+
+
+
+        # top_heads = [(rows[i], cols[i], -1) for i in range(len(rows))]
+
+        torch.save(top_heads, bernoullis_path)
+
+
+    intervention_locations = torch.load(bernoullis_path)
+
+    print(len(intervention_locations))
+
+    model_resid_dim = model_config['resid_dim']
+    model_n_heads = model_config['n_heads']
+    model_head_dim = model_resid_dim//model_n_heads
+    # device = model.device
+
+    # function_vector = torch.zeros((1,1,model_resid_dim)).to(device)
+    function_vector = torch.zeros((1, 1, model_resid_dim))
+    T = -1 # Intervention & values taken from last token
+
+    for L,H,_ in intervention_locations:
+        if 'gpt2-xl' in model_config['name_or_path'].lower():
+            out_proj = model.transformer.h[L].attn.c_proj
+        elif 'gpt-j' in model_config['name_or_path'].lower():
+            out_proj = model.transformer.h[L].attn.out_proj
+        elif 'llama' in model_config['name_or_path'].lower() or 'gemma' in model_config['name_or_path'].lower() or 'olmo' in model_config['name_or_path'].lower():
+            out_proj = model.model.layers[L].self_attn.o_proj
+        elif 'gpt-neox' in model_config['name_or_path'] or 'pythia' in model_config['name_or_path']:
+            out_proj = model.gpt_neox.layers[L].attention.dense
+        elif 'qwen' in model_config['name_or_path'].lower():
+            out_proj = model.model.layers[L].self_attn.o_proj
+        elif 'deepseek' in model_config['name_or_path'].lower():
+            out_proj = model.model.layers[L].self_attn.o_proj
+
+        # device = next(out_proj.parameters()).device
+        device = model.device
+        function_vector = function_vector.to(device)
+        x = torch.zeros(model_resid_dim)
+        x[H*model_head_dim:(H+1)*model_head_dim] = mean_activations[L,H,T]
+        d_out = out_proj(x.reshape(1,1,model_resid_dim).to(model.dtype)).to(function_vector.device)
+
+        function_vector += d_out
+    
+    function_vector = function_vector.to(model.dtype)
+    function_vector = function_vector.reshape(1, model_resid_dim)
+    return function_vector
+    # return function_vector, top_heads
+
+"""
+def compute_reinforce_function_vector(bernoullis_path, bernoullis, mean_activations, model, model_config, tokenizer, dataset):
+    if isinstance(bernoullis[0], tuple):
+        bernoullis = torch.stack([torch.tensor([x[0].item(), x[1].item(), x[2]]) for x in bernoullis])
+
+    top_heads = []
+
+    for layer_idx in range(len(bernoullis)):
+        probs = bernoullis[layer_idx]  # shape: [16]
+        for head_idx in range(probs.size(0)):
+            layer_tensor = torch.tensor(layer_idx)
+            head_tensor = torch.tensor(head_idx)
+            prob = probs[head_idx].item() if isinstance(probs[head_idx], torch.Tensor) else probs[head_idx]
+            top_heads.append((layer_tensor, head_tensor, prob, -1))
+        
+    torch.save(top_heads, bernoullis_path)
+    intervention_locations = torch.load(bernoullis_path)
+
+    print(len(intervention_locations))
+
+    model_resid_dim = model_config['resid_dim']
+    model_n_heads = model_config['n_heads']
+    model_head_dim = model_resid_dim//model_n_heads
+
+    function_vector = torch.zeros((1, 1, model_resid_dim))
+    T = -1 # Intervention & values taken from last token
+
+    for L, H, p, _ in intervention_locations:
+        if 'gpt2-xl' in model_config['name_or_path'].lower():
+            out_proj = model.transformer.h[L].attn.c_proj
+        elif 'gpt-j' in model_config['name_or_path'].lower():
+            out_proj = model.transformer.h[L].attn.out_proj
+        elif 'llama' in model_config['name_or_path'].lower() or 'gemma' in model_config['name_or_path'].lower() or 'olmo' in model_config['name_or_path'].lower():
+            out_proj = model.model.layers[L].self_attn.o_proj
+        elif 'gpt-neox' in model_config['name_or_path'] or 'pythia' in model_config['name_or_path']:
+            out_proj = model.gpt_neox.layers[L].attention.dense
+        elif 'qwen' in model_config['name_or_path'].lower():
+            out_proj = model.model.layers[L].self_attn.o_proj
+        elif 'deepseek' in model_config['name_or_path'].lower():
+            out_proj = model.model.layers[L].self_attn.o_proj
+    
+        # device = next(out_proj.parameters()).device
+        device = model.device
+        function_vector = function_vector.to(device)
+        x = torch.zeros(model_resid_dim)
+        x[H*model_head_dim:(H+1)*model_head_dim] = mean_activations[L,H,T] * p
+        d_out = out_proj(x.reshape(1,1,model_resid_dim).to(device).to(model.dtype))
+        function_vector += d_out
+
+    function_vector = function_vector.to(model.dtype)
+    function_vector = function_vector.reshape(1, model_resid_dim)
+    return function_vector, top_heads
+"""
+#————————————————————————⬆————————————————————————#

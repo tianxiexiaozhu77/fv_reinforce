@@ -205,7 +205,7 @@ def sentence_eval(sentence, target, model, tokenizer, compute_nll=True, generate
         return clean_output 
 
 
-def n_shot_eval(dataset, fv_vector, edit_layer: int, n_shots: int, model, model_config, tokenizer, shuffle_labels:bool=False,
+def n_shot_eval(dataset, fv_vector, edit_layer, n_shots: int, model, model_config, tokenizer, shuffle_labels:bool=False,
                 filter_set=None, prefixes=None, separators=None, generate_str=False, pred_filepath=None,
                 metric="f1_score"):
     """

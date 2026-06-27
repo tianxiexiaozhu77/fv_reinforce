@@ -15,13 +15,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     parser.add_argument('--dataset_name', help='Name of the dataset to be loaded', type=str, required=True)
-    parser.add_argument('--n_eval_templates', help='Number of templates to evaluate with', required=True, type=int, default=15)
+    parser.add_argument('--n_eval_templates', help='Number of templates to evaluate with', required=False, type=int, default=20)
     parser.add_argument('--edit_layer', help='Layer for intervention. If -1, sweep over all layers', type=int, required=False, default=9) # 
 
     parser.add_argument('--n_top_heads', help='Number of attenion head outputs used to compute function vector', required=False, type=int, default=10)
     parser.add_argument('--model_name', help='Name of model to be loaded', type=str, required=False, default='EleutherAI/gpt-j-6b')
-    parser.add_argument('--root_data_dir', help='Root directory of data files', type=str, required=False, default='../dataset_files')
+    parser.add_argument('--root_data_dir', help='Root directory of data files', type=str, required=False, default='/storage/3090group2/hyl/function_vectors/dataset_files')
     parser.add_argument('--save_path_root', help='File path to save to', type=str, required=False, default='../results')
+    parser.add_argument('--ie_path_root', help='File path to load indirect effects from', type=str, required=False, default=None)
     parser.add_argument('--seed', help='Randomized seed', type=int, required=False, default=5678)
     parser.add_argument('--device', help='Device to run on',type=str, required=False, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--mean_activations_path', help='Path to file containing mean_head_activations for the specified task', required=False, type=str, default=None)
@@ -37,6 +38,7 @@ if __name__ == "__main__":
     model_name = args.model_name
     root_data_dir = args.root_data_dir
     save_path_root = f"{args.save_path_root}/{dataset_name}"
+    ie_path_root = f"{args.ie_path_root}/{dataset_name}" if args.ie_path_root else save_path_root
     seed = args.seed
     device = args.device
     mean_activations_path = args.mean_activations_path
@@ -83,9 +85,22 @@ if __name__ == "__main__":
                                                      n_icl_examples=n_shots, N_TRIALS=n_trials, prefixes=prefixes, separators=separators)
         args.mean_activations_path = f'{save_path_root}/{dataset_name}_mean_head_activations.pt'
         torch.save(mean_activations, args.mean_activations_path)
-        
-    # Compute Function Vector
-    fv, top_heads = compute_universal_function_vector(mean_activations, model, model_config=model_config, n_top_heads=n_top_heads)   
+    #————————————————————————⬇————————————————————————#
+
+    bernoullis_path = f"{ie_path_root}/{dataset_name}_bernoullis.pt"
+    bernoullis_save_path = f"{ie_path_root}/bernoullis.pt"
+    # bernoullis_path = "/opt/data/private/hyl/function_vectors/src/results/gptj/gptj_all_layer/average_top_heads.pt"
+    # bernoullis_save_path = "/opt/data/private/hyl/function_vectors/src/results/gptj/gptj_all_layer/average_bernoullis.pt"
+    if os.path.exists(bernoullis_save_path):
+        bernoullis = torch.load(bernoullis_save_path)
+
+    # fv, top_heads = compute_reinforce_function_vector(args, bernoullis_path, bernoullis, mean_activations, model, model_config, tokenizer, dataset)
+
+    fv = compute_reinforce_function_vector(args, bernoullis_path, bernoullis, mean_activations, model, model_config, tokenizer, dataset)
+
+    # # Compute Function Vector
+    # fv, top_heads = compute_universal_function_vector(mean_activations, model, model_config=model_config, n_top_heads=n_top_heads)   
+    #————————————————————————⬆————————————————————————#
     
     print("Computing Portability")
     fs_res_dict, zs_res_dict,fs_shuffled_res_dict, templates = portability_eval(dataset, fv, eval_edit_layer, model, model_config, tokenizer, n_eval_templates=n_eval_templates)

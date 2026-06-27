@@ -78,7 +78,7 @@ def replace_activation_w_avg(layer_head_token_pairs, avg_activations, model, mod
                 out_proj_bias = proj_module.bias
                 new_output = torch.addmm(out_proj_bias, inputs.squeeze(), out_proj.T)
             
-            elif 'llama' in model_config['name_or_path']:
+            elif 'llama' in model_config['name_or_path'] or 'deepseek' in model_config['name_or_path']:
                 if '70b' in model_config['name_or_path']:
                     # need to dequantize weights
                     out_proj_dequant = bnb.functional.dequantize_4bit(out_proj.data, out_proj.quant_state)
@@ -87,6 +87,9 @@ def replace_activation_w_avg(layer_head_token_pairs, avg_activations, model, mod
                     new_output = torch.matmul(inputs, out_proj.T)
             
             elif 'olmo' in model_config['name_or_path'].lower():
+                new_output = torch.matmul(inputs, out_proj.T)
+            
+            elif 'qwen' in model_config['name_or_path'].lower():
                 new_output = torch.matmul(inputs, out_proj.T)
 
             return new_output
@@ -111,8 +114,11 @@ def add_function_vector(edit_layer, fv_vector, device, idx=-1):
     def add_act(output, layer_name):
         current_layer = int(layer_name.split(".")[2])
         if current_layer == edit_layer:
+        # if current_layer in edit_layer:
             if isinstance(output, tuple):
-                output[0][:, idx] += fv_vector.to(device)
+                output_device = output[0].device
+                # output[0][:, idx] += fv_vector.to(device)
+                output[0][:, idx] += fv_vector.to(output_device)
                 return output
             else:
                 return output
@@ -292,7 +298,7 @@ def add_avg_to_activation(layer_head_token_pairs, avg_activations, model, model_
                 out_proj_bias = proj_module.bias
                 new_output = torch.addmm(out_proj_bias, inputs.squeeze(), out_proj.T)
             
-            elif 'llama' in model_config['name_or_path']:
+            elif 'llama' in model_config['name_or_path'] or 'deepseek' in model_config['name_or_path']:
                 if '70b' in model_config['name_or_path']:
                     # need to dequantize weights
                     out_proj_dequant = bnb.functional.dequantize_4bit(out_proj.data, out_proj.quant_state)

@@ -40,7 +40,8 @@ def load_gpt_model_and_tokenizer(model_name:str, device='cuda', revision=None):
     elif 'gpt-j' in model_name.lower():
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         tokenizer.pad_token = tokenizer.eos_token
-        model = AutoModelForCausalLM.from_pretrained(model_name, low_cpu_mem_usage=True).to(device)
+        # model = AutoModelForCausalLM.from_pretrained(model_name, low_cpu_mem_usage=True).to(device)
+        model = AutoModelForCausalLM.from_pretrained(model_name, device_map = "auto", low_cpu_mem_usage=True)
 
         MODEL_CONFIG={"n_heads":model.config.n_head,
                       "n_layers":model.config.n_layer,
@@ -56,7 +57,8 @@ def load_gpt_model_and_tokenizer(model_name:str, device='cuda', revision=None):
         if revision is not None and 'pythia' in model_name.lower():
             model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16, revision=revision).to(device)
         else:
-            model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16).to(device)
+            # model = AutoModelForCausalLM.from_pretrained(model_name, device_map = "auto", torch_dtype=torch.float16).to(device)
+            model = AutoModelForCausalLM.from_pretrained(model_name, device_map = "auto", torch_dtype=torch.float16)
 
         MODEL_CONFIG={"n_heads":model.config.num_attention_heads,
                       "n_layers":model.config.num_hidden_layers,
@@ -79,7 +81,7 @@ def load_gpt_model_and_tokenizer(model_name:str, device='cuda', revision=None):
                       "layer_hook_names":[f'model.layers.{layer}' for layer in range(model.config.num_hidden_layers)],
                       "prepend_bos":True}
         
-    elif 'llama' in model_name.lower():
+    elif 'llama' in model_name.lower() or 'deepseek' in model_name.lower():
         if '70b' in model_name.lower():
             # use quantization. requires `bitsandbytes` library
             from transformers import BitsAndBytesConfig
@@ -97,7 +99,8 @@ def load_gpt_model_and_tokenizer(model_name:str, device='cuda', revision=None):
             )
         else:
             if '7b' in model_name.lower() or '8b' in model_name.lower():
-                model_dtype = torch.float32
+                # model_dtype = torch.float32
+                model_dtype = torch.float16
             else: #half precision for bigger llama models
                 model_dtype = torch.float16
             
@@ -129,6 +132,19 @@ def load_gpt_model_and_tokenizer(model_name:str, device='cuda', revision=None):
                       "n_layers":model.config.num_hidden_layers,
                       "resid_dim":model.config.hidden_size,
                       "name_or_path":model.config._name_or_path,
+                      "attn_hook_names":[f'model.layers.{layer}.self_attn.o_proj' for layer in range(model.config.num_hidden_layers)],
+                      "layer_hook_names":[f'model.layers.{layer}' for layer in range(model.config.num_hidden_layers)],
+                      "prepend_bos":False}
+    
+    elif 'qwen' in model_name.lower():
+        model_dtype = torch.float16
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=model_dtype).to(device)
+
+        MODEL_CONFIG={"n_heads":model.config.num_attention_heads,
+                      "n_layers":model.config.num_hidden_layers,
+                      "resid_dim":model.config.hidden_size,
+                      "name_or_path":model.config.name_or_path,
                       "attn_hook_names":[f'model.layers.{layer}.self_attn.o_proj' for layer in range(model.config.num_hidden_layers)],
                       "layer_hook_names":[f'model.layers.{layer}' for layer in range(model.config.num_hidden_layers)],
                       "prepend_bos":False}

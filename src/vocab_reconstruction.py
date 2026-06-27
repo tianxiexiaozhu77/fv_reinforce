@@ -1,23 +1,27 @@
 import os
 import torch, numpy as np
+import torch.nn as nn
 import argparse
 
 # Include prompt creation helper functions
 from utils.prompt_utils import load_dataset
-from utils.extract_utils import get_mean_head_activations, compute_universal_function_vector
+from utils.extract_utils import get_mean_head_activations, compute_universal_function_vector, compute_reinforce_function_vector
 from utils.eval_utils import n_shot_eval_no_intervention, n_shot_eval
 from utils.model_utils import load_gpt_model_and_tokenizer, set_seed
+from tqdm import tqdm
 
 def optim_loop(v_n, target, decoder, loss_fn, optimizer, n_steps:int=1000, verbose:bool=False, restrict_vocab:int=50400):
     if target.shape[-1] != restrict_vocab:
-        inds = torch.topk(target, restrict_vocab).indices[0]
-        Z = torch.zeros(target.size()).cuda()
+        inds = torch.topk(target, restrict_vocab).indices[0] # tarket中top k个索引
+        Z = torch.zeros(target.size()).to(target.device)
         Z[:,inds] = target[:,inds]
     else:
         Z = target
             
-    for i in range(n_steps):
-        loss = loss_fn(decoder(v_n),Z)
+    for i in tqdm(range(n_steps), total=n_steps):
+        v_n = v_n.to(next(decoder.parameters()).device)
+        Z = Z.to(next(decoder.parameters()).device)
+        loss = loss_fn(decoder(v_n),Z) # 让v_n靠近Z
         loss.backward()
         if verbose:
             print(f"Loss:{loss.item()}, iter:{i}")
@@ -25,7 +29,7 @@ def optim_loop(v_n, target, decoder, loss_fn, optimizer, n_steps:int=1000, verbo
         optimizer.zero_grad()
     return v_n
 
-def vocab_reconstruction(datasets, n_steps:int=1000, lr:float=0.5, n_seeds:int=5, n_trials:int=100, n_shots:int=10, restrict_vocab_list=[100,50400], return_vecs:bool=False):
+def vocab_reconstruction(datasets, save_path_root, n_steps:int=1000, lr:float=0.5, n_seeds:int=5, n_trials:int=100, n_shots:int=10, restrict_vocab_list=[100,50400], return_vecs:bool=False):
     """
     Computes and evaluates a function vector reconstruction which matches its output vocabulary distribution.
     
@@ -70,11 +74,19 @@ def vocab_reconstruction(datasets, n_steps:int=1000, lr:float=0.5, n_seeds:int=5
 
             fs_results_validation = n_shot_eval_no_intervention(dataset=dataset, n_shots=n_shots, model=model, model_config=model_config, tokenizer=tokenizer, compute_ppl=False, test_split='valid')
             filter_set_validation = np.where(np.array(fs_results_validation['clean_rank_list']) == 0)[0]
-            
-            mean_activations = get_mean_head_activations(dataset, model=model, model_config=model_config, tokenizer=tokenizer, n_icl_examples=n_shots,
-                                                        N_TRIALS=n_trials, filter_set=filter_set_validation)
 
-            fv, _ = compute_universal_function_vector(mean_activations, model, model_config)
+            mean_activations_path = f'{save_path_root}/{dataset_name}/{dataset_name}_mean_head_activations.pt'
+            bernoullis_path = f"{save_path_root}/{dataset_name}/{dataset_name}_bernoullis.pt"
+            bernoullis_save_path = f"{save_path_root}/{dataset_name}/bernoullis.pt"
+
+            mean_activations = torch.load(mean_activations_path)  
+            
+            bernoullis = torch.load(bernoullis_save_path)
+            # mean_activations = get_mean_head_activations(dataset, model=model, model_config=model_config, tokenizer=tokenizer, n_icl_examples=n_shots,
+            #                                             N_TRIALS=n_trials, filter_set=filter_set_validation)
+
+            # fv, _ = compute_universal_function_vector(mean_activations, model, model_config)
+            fv = compute_reinforce_function_vector(args, bernoullis_path, bernoullis, mean_activations, model, model_config, tokenizer, dataset)
             
             fs_results = n_shot_eval_no_intervention(dataset=dataset, n_shots=n_shots, model=model, model_config=model_config, tokenizer=tokenizer, compute_ppl=False, test_split='test')
             filter_set = np.where(np.array(fs_results['clean_rank_list']) == 0)[0]
@@ -94,20 +106,45 @@ def vocab_reconstruction(datasets, n_steps:int=1000, lr:float=0.5, n_seeds:int=5
                 # Optim setup
                 loss_fn = torch.nn.CrossEntropyLoss()
                 optimizer = torch.optim.Adam([v_n], lr=lr)
-                decoder = torch.nn.Sequential(model.transformer.ln_f, model.lm_head).to(model.device)
+
+                target_device = fv.device
+                # 复制ln_f
+                ln_f = model.transformer.ln_f
+                new_ln_f = nn.LayerNorm(
+                    normalized_shape=ln_f.normalized_shape,
+                    eps=ln_f.eps,
+                    elementwise_affine=ln_f.elementwise_affine
+                ).to(target_device)
+                new_ln_f.weight.data = ln_f.weight.data.to(target_device)
+                if ln_f.bias is not None:
+                    new_ln_f.bias.data = ln_f.bias.data.to(target_device)
+                # 复制lm_head
+                lm_head = model.lm_head
+                new_lm_head = nn.Linear(
+                    in_features=lm_head.in_features,
+                    out_features=lm_head.out_features,
+                    bias=(lm_head.bias is not None)
+                ).to(target_device)
+                new_lm_head.weight.data = lm_head.weight.data.to(target_device)
+                if lm_head.bias is not None:
+                    new_lm_head.bias.data = lm_head.bias.data.to(target_device)
+                # 组合
+                decoder = nn.Sequential(new_ln_f, new_lm_head).to(target_device)
+                # decoder = torch.nn.Sequential(model.transformer.ln_f, model.lm_head).to(fv.device)
+                # decoder = decoder.to(model.device)
 
                 decoder.requires_grad=True
                 for p in decoder.parameters():
                     p.requires_grad = True
 
-                target = torch.nn.functional.softmax(decoder(fv), dim=-1).detach()
+                target = torch.nn.functional.softmax(decoder(fv), dim=-1).detach() # (1, 50400)目标
 
-                computed_vn = optim_loop(v_n, target, decoder, loss_fn, optimizer, verbose=False, n_steps=n_steps, restrict_vocab=vocab_size)
+                computed_vn = optim_loop(v_n, target, decoder, loss_fn, optimizer, verbose=False, n_steps=n_steps, restrict_vocab=vocab_size) # (1, 4096)
                 
                 scaled_vn = computed_vn / torch.linalg.norm(computed_vn) * torch.linalg.norm(fv)
 
                 zs_reconstruction_results = n_shot_eval(dataset=dataset, fv_vector=scaled_vn, edit_layer=9, n_shots=0,
-                                        model=model, model_config=model_config, tokenizer=tokenizer, filter_set=filter_set)
+                                        model=model, model_config=model_config, tokenizer=tokenizer, filter_set=filter_set) # 用scaled_vn干预
                 
                 zs_results[dataset_name][j].append(zs_reconstruction_results)
                 vns[dataset_name][j].append(scaled_vn.detach())
@@ -136,8 +173,8 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_name', help='Name of model to be loaded', type=str, required=False, default='EleutherAI/gpt-j-6b')
-    parser.add_argument('--root_data_dir', help='Root directory of data files', type=str, required=False, default='../dataset_files')
-    parser.add_argument('--save_path_root', help='File path to save mean activations to', type=str, required=False, default='../results')
+    parser.add_argument('--root_data_dir', help='Root directory of data files', type=str, required=False, default='/storage/3090group2/hyl/function_vectors/dataset_files')
+    parser.add_argument('--save_path_root', help='File path to save mean activations to', type=str, required=False, default='/storage/3090group2/hyl/function_vectors/src/results')
     parser.add_argument('--n_seeds', help='Number of seeds', type=int, required=False, default=5)
     parser.add_argument('--n_trials', help='Number of trials to use for computing task-conditioned mean head activations', type=int, required=False, default=100)
     parser.add_argument('--n_shots', help='Number of shots to use for prompts when computing task-conditioned mean head activations', type=int, required=False, default=10)
@@ -161,16 +198,17 @@ if __name__ == "__main__":
     torch.set_grad_enabled(False)
     model, tokenizer, model_config = load_gpt_model_and_tokenizer(model_name)
 
-    datasets = ['antonym', 'english-french', 'capitalize', 'present-past', 'singular-plural', 'country-capital']
+    # datasets = ['antonym', 'english-french', 'capitalize', 'present-past', 'singular-plural', 'country-capital']
+    datasets = ['antonym']
     args.datasets = datasets
 
     # Test Loop:
-    orig_results, zs_results, kl_divs = vocab_reconstruction(datasets, n_steps=n_steps, lr=lr, n_seeds=n_seeds, n_trials=n_trials, n_shots=n_shots, restrict_vocab_list=[100,50400])
+    orig_results, zs_results, kl_divs = vocab_reconstruction(datasets, save_path_root, n_steps=n_steps, lr=lr, n_seeds=n_seeds, n_trials=n_trials, n_shots=n_shots, restrict_vocab_list=[100,50400])
   
 
     # Extract Summary Results:
     os.makedirs(os.path.join(save_path_root), exist_ok=True)
-    with open(os.path.join(save_path_root, 'reconstruction_results.txt'), 'w') as out_file:
+    with open(os.path.join(save_path_root, 'reconstruction_results_editlayer9_10_1.txt'), 'w') as out_file:
 
         for dataset_name in datasets:
             print(f"{dataset_name.title()}:", file=out_file)
@@ -187,5 +225,5 @@ if __name__ == "__main__":
             print("v_full results:", np.mean(vfull_acc).round(3)*100, '% +/-', np.std(vfull_acc).round(3)*100, file=out_file)
             print("KLFull:", np.mean(klfull_val).round(5), '+/-', np.std(klfull_val).round(5), '\n', file=out_file)
     
-    with open(os.path.join(save_path_root, 'reconstruction_args.txt'), 'w') as arg_file:
+    with open(os.path.join(save_path_root, 'reconstruction_args_editlayer9.txt'), 'w') as arg_file:
         print(args.__dict__, file=arg_file)
